@@ -103,9 +103,16 @@ class InvalidEvaluationError(ReviewError):
 
 
 def review_exception_handler(exc, context):
-    """DRF exception handler that renders ReviewError as a clean JSON body.
+    """The project-wide DRF exception handler.
 
-    The full detail is logged; only `user_message` crosses the network.
+    Registered as `EXCEPTION_HANDLER`, so it sees every failure in every app,
+    not only the reviews ones. It does two things:
+
+      * renders a `ReviewError` as `{"detail", "code"}` with the right status,
+        logging the full detail while only `user_message` crosses the network;
+      * gives every other `APIException` - the accounts app raises several -
+        the same `code` key, so one error shape reaches the frontend rather
+        than two that differ by which app raised them.
     """
     if isinstance(exc, ReviewError):
         logger.error(
@@ -119,4 +126,18 @@ def review_exception_handler(exc, context):
             status=exc.status_code,
         )
 
-    return drf_exception_handler(exc, context)
+    response = drf_exception_handler(exc, context)
+
+    # Only for the single-message form. A ValidationError's body is a map of
+    # field name to messages, and adding a key there would invent a field.
+    if (
+        response is not None
+        and isinstance(response.data, dict)
+        and "detail" in response.data
+        and "code" not in response.data
+    ):
+        code = getattr(exc, "default_code", None)
+        if isinstance(code, str):
+            response.data["code"] = code
+
+    return response

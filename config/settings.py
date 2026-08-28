@@ -19,6 +19,7 @@ connection until data quietly goes to the wrong place.
 from __future__ import annotations
 
 import os
+from datetime import timedelta
 from pathlib import Path
 
 from django.core.exceptions import ImproperlyConfigured
@@ -109,7 +110,13 @@ INSTALLED_APPS = [
     # Third party
     "rest_framework",
     "corsheaders",
+    # Refresh-token rotation is only useful if the token it replaces stops
+    # working, and this app is what holds the list of tokens rotated out of
+    # use. Without it, ROTATE_REFRESH_TOKENS issues a new token and quietly
+    # leaves the old one valid.
+    "rest_framework_simplejwt.token_blacklist",
     # Local
+    "accounts",
     "reviews",
 ]
 
@@ -223,7 +230,119 @@ REST_FRAMEWORK = {
     # Renders typed ReviewErrors as a safe JSON body with the right status.
     "EXCEPTION_HANDLER": "reviews.exceptions.review_exception_handler",
     "UNAUTHENTICATED_USER": None,
+    # A bearer token, not a session cookie. Angular and Django are different
+    # origins in development, and a cookie session across them would need
+    # credentialed CORS plus a CSRF token on every write; a signed token in an
+    # Authorization header needs neither and behaves the same in production.
+    "DEFAULT_AUTHENTICATION_CLASSES": [
+        "rest_framework_simplejwt.authentication.JWTAuthentication",
+    ],
+    # Open by default, locked per view. This application genuinely has public
+    # endpoints - health, and the marking scheme the landing page explains
+    # itself with - so a global IsAuthenticated would be wrong; but the default
+    # is the permissive one, which means a new view is public until somebody
+    # says otherwise. Every view therefore declares its own permission class,
+    # including the public ones, so the answer is visible where the view is
+    # rather than inferred from this setting.
+    "DEFAULT_PERMISSION_CLASSES": ["rest_framework.permissions.AllowAny"],
+    # Throttling is per-view, via ScopedRateThrottle. The rates below cover the
+    # endpoints worth attacking: a password guess, a sign-up flood, a refresh
+    # loop. Anonymous callers are counted per IP, which is crude, but it is
+    # what stops a single host running a dictionary attack.
+    "DEFAULT_THROTTLE_RATES": {
+        "auth_login": env_str("THROTTLE_AUTH_LOGIN", "10/min"),
+        "auth_register": env_str("THROTTLE_AUTH_REGISTER", "5/hour"),
+        "auth_refresh": env_str("THROTTLE_AUTH_REFRESH", "60/hour"),
+        "auth_password": env_str("THROTTLE_AUTH_PASSWORD", "5/hour"),
+        "auth_oauth": env_str("THROTTLE_AUTH_OAUTH", "30/hour"),
+    },
 }
+
+
+# --------------------------------------------------------------------------
+# Authentication
+# --------------------------------------------------------------------------
+# A custom user model is used from the start (see accounts/models.py). Its one
+# substantive difference from Django's is that email is unique, which is what
+# makes matching an incoming OAuth account to an existing user safe.
+
+AUTH_USER_MODEL = "accounts.User"
+
+SIMPLE_JWT = {
+    # Short, because an access token cannot be revoked once issued: this is the
+    # window in which a stolen one is still usable.
+    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=env_int("JWT_ACCESS_MINUTES", 15)),
+    # Long enough that a returning user is not asked to sign in every day,
+    # short enough that an abandoned token expires on its own.
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=env_int("JWT_REFRESH_DAYS", 14)),
+    # Every refresh returns a new refresh token and blacklists the one used.
+    # A refresh token presented twice means it was copied, and the second use
+    # fails - so a theft becomes a logout rather than a silent second session.
+    "ROTATE_REFRESH_TOKENS": True,
+    "BLACKLIST_AFTER_ROTATION": True,
+    "UPDATE_LAST_LOGIN": True,
+    "ALGORITHM": "HS256",
+    # Falls back to SECRET_KEY. Set JWT_SIGNING_KEY to rotate token signing on
+    # its own: everything else derived from SECRET_KEY - sessions, CSRF tokens,
+    # the OAuth state and ticket signatures - would otherwise break with it.
+    "SIGNING_KEY": os.environ.get("JWT_SIGNING_KEY", "").strip() or SECRET_KEY,
+    "AUTH_HEADER_TYPES": ("Bearer",),
+    "USER_ID_FIELD": "id",
+    "USER_ID_CLAIM": "user_id",
+}
+
+
+# --------------------------------------------------------------------------
+# OAuth sign-in (GitHub, Google)
+# --------------------------------------------------------------------------
+# Client secrets are read here and never leave the backend. The browser only
+# ever sees the client id, inside the authorization URL this server builds.
+#
+# A provider with no id and secret is not offered at all: /api/auth/providers/
+# publishes the configured list, and the frontend renders only those buttons.
+
+OAUTH_CREDENTIALS = {
+    "github": {
+        "client_id": os.environ.get("GITHUB_OAUTH_CLIENT_ID", "").strip(),
+        "client_secret": os.environ.get("GITHUB_OAUTH_CLIENT_SECRET", "").strip(),
+    },
+    "google": {
+        "client_id": os.environ.get("GOOGLE_OAUTH_CLIENT_ID", "").strip(),
+        "client_secret": os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET", "").strip(),
+    },
+}
+
+# Where the provider sends the browser back to. This is Django's own public
+# origin, not the frontend's: the callback has to run here so the client secret
+# and the token exchange stay server-side.
+OAUTH_CALLBACK_BASE_URL = env_str("OAUTH_CALLBACK_BASE_URL", "http://localhost:8000")
+
+# The path each provider redirects to, per provider rather than one shared
+# shape. The redirect URI has to match what is registered in the provider's
+# console character for character - trailing slash included - and the console
+# is often filled in first, so the code follows it rather than the other way
+# round. The defaults are the URIs registered for this project.
+#
+# These are the source of truth in both directions: accounts/urls.py builds the
+# routes from this dict, and accounts/oauth/registry.py builds the redirect_uri
+# sent to the provider from it, so the route served and the URI advertised
+# cannot drift apart.
+OAUTH_CALLBACK_PATHS = {
+    "github": env_str("GITHUB_OAUTH_REDIRECT_PATH", "/auth/github/callback"),
+    "google": env_str("GOOGLE_OAUTH_REDIRECT_PATH", "/login/oauth2/code/google"),
+}
+
+# Where that callback hands control back to Angular.
+FRONTEND_BASE_URL = env_str("FRONTEND_BASE_URL", "http://localhost:4200")
+FRONTEND_OAUTH_CALLBACK_PATH = env_str("FRONTEND_OAUTH_CALLBACK_PATH", "/auth/callback")
+
+OAUTH_HTTP_TIMEOUT_SECONDS = env_int("OAUTH_HTTP_TIMEOUT_SECONDS", 10)
+# How long a started sign-in may take to come back from the provider. Ten
+# minutes covers "approve the consent screen, then go and find your 2FA device".
+OAUTH_STATE_MAX_AGE_SECONDS = env_int("OAUTH_STATE_MAX_AGE_SECONDS", 600)
+# How long the ticket in the callback URL is worth anything. The frontend
+# redeems it on page load, so two minutes is slack rather than a window.
+OAUTH_TICKET_MAX_AGE_SECONDS = env_int("OAUTH_TICKET_MAX_AGE_SECONDS", 120)
 
 
 # --------------------------------------------------------------------------
@@ -237,6 +356,9 @@ CORS_ALLOWED_ORIGINS = env_list(
     "CORS_ALLOWED_ORIGINS",
     default=("http://localhost:4200", "http://127.0.0.1:4200"),
 )
+# Tokens travel in the Authorization header, which django-cors-headers already
+# permits. No cookie crosses origins, so credentialed CORS - which would also
+# force exact-origin matching and a CSRF token - is not needed and stays off.
 CORS_ALLOW_CREDENTIALS = False
 
 
@@ -272,7 +394,13 @@ AI_MAX_RETRIES = env_int("AI_MAX_RETRIES", 1)
 
 AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
-    {"NAME": "django.contrib.auth.password_validation.MinimumLengthValidator"},
+    {
+        "NAME": "django.contrib.auth.password_validation.MinimumLengthValidator",
+        # Above Django's default of 8. The registration serializer enforces the
+        # same floor so the message arrives on the field, but this is the check
+        # that also covers createsuperuser and any future password reset.
+        "OPTIONS": {"min_length": env_int("PASSWORD_MIN_LENGTH", 8)},
+    },
     {"NAME": "django.contrib.auth.password_validation.CommonPasswordValidator"},
     {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
 ]

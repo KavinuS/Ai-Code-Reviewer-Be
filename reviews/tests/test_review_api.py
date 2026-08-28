@@ -4,6 +4,11 @@ mapping from domain errors to HTTP status codes.
 
 The stub provider is selected via settings, so these exercise the real view,
 serializers, service stack and exception handler without a network call.
+
+Every request here carries a bearer token, because the endpoint requires an
+account. The token is a real one, minted the same way a sign-in mints it,
+rather than a patched-out permission class: a test that disables the check it
+is running under would keep passing if the check were removed.
 """
 
 from __future__ import annotations
@@ -11,8 +16,10 @@ from __future__ import annotations
 import json
 from unittest.mock import patch
 
+from django.contrib.auth import get_user_model
 from django.test import TestCase, override_settings
 
+from accounts.services.tokens import issue_token_pair
 from reviews.exceptions import (
     AINotConfiguredError,
     AIServiceUnavailableError,
@@ -22,14 +29,39 @@ from reviews.exceptions import (
 )
 from reviews.serializers import MAX_CODE_LENGTH
 
+User = get_user_model()
+
 URL = "/api/reviews/"
+
+VALID_PAYLOAD = {"language": "python", "code": "x = 1"}
+
+
+class AuthenticatedReviewTestCase(TestCase):
+    """Base for the classes that submit a review.
+
+    The user is created once per class. No password is set - these tests never
+    sign in through the login endpoint, they carry the token a sign-in would
+    have produced.
+    """
+
+    @classmethod
+    def setUpTestData(cls) -> None:
+        cls.user = User.objects.create(username="reviewer", email="reviewer@example.com")
+        cls.user.set_unusable_password()
+        cls.user.save()
+        cls.access = issue_token_pair(cls.user)["access"]
+
+    def post(self, payload: dict):
+        return self.client.post(
+            URL,
+            data=json.dumps(payload),
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {self.access}",
+        )
 
 
 @override_settings(AI_PROVIDER="stub", AI_MAX_RETRIES=0)
-class ReviewCreationTests(TestCase):
-    def post(self, payload: dict):
-        return self.client.post(URL, data=json.dumps(payload), content_type="application/json")
-
+class ReviewCreationTests(AuthenticatedReviewTestCase):
     def test_valid_submission_returns_a_complete_review(self) -> None:
         response = self.post(
             {
@@ -107,14 +139,16 @@ class ReviewCreationTests(TestCase):
         self.assertIn("sum", evaluation["calculationExplanation"])
 
     def test_get_is_not_allowed_yet(self) -> None:
-        # Listing arrives in Phase 5 with the database.
-        self.assertEqual(self.client.get(URL).status_code, 405)
+        # Listing arrives in Phase 5 with the database. The token is needed to
+        # see the 405 at all: DRF checks permissions before it looks up a
+        # handler, so an anonymous GET is turned away as 401 first.
+        response = self.client.get(URL, HTTP_AUTHORIZATION=f"Bearer {self.access}")
+
+        self.assertEqual(response.status_code, 405)
 
 
 @override_settings(AI_PROVIDER="stub", AI_MAX_RETRIES=0)
-class ReviewValidationTests(TestCase):
-    def post(self, payload: dict):
-        return self.client.post(URL, data=json.dumps(payload), content_type="application/json")
+class ReviewValidationTests(AuthenticatedReviewTestCase):
 
     def test_empty_code_is_rejected(self) -> None:
         response = self.post({"language": "python", "code": "   \n  "})
@@ -168,21 +202,68 @@ class ReviewValidationTests(TestCase):
 
 
 @override_settings(AI_PROVIDER="stub", AI_MAX_RETRIES=0)
-class ReviewErrorMappingTests(TestCase):
-    """Each domain failure must produce the right status and a safe message."""
+class ReviewRequiresAnAccountTests(TestCase):
+    """Running a review is not anonymous.
 
-    def post(self):
-        return self.client.post(
-            URL,
-            data=json.dumps({"language": "python", "code": "x = 1"}),
-            content_type="application/json",
+    Asserted at the HTTP layer rather than by inspecting `permission_classes`,
+    because what matters is that the request is refused - and refused *before*
+    the AI provider is reached, since the whole point is that an anonymous
+    caller cannot spend money.
+    """
+
+    def test_anonymous_submission_is_refused(self) -> None:
+        response = self.client.post(
+            URL, data=json.dumps(VALID_PAYLOAD), content_type="application/json"
         )
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_a_rejected_submission_never_reaches_the_review_service(self) -> None:
+        with patch("reviews.views.ReviewService.create_review") as create_review:
+            self.client.post(
+                URL, data=json.dumps(VALID_PAYLOAD), content_type="application/json"
+            )
+
+        create_review.assert_not_called()
+
+    def test_a_garbage_token_is_refused(self) -> None:
+        response = self.client.post(
+            URL,
+            data=json.dumps(VALID_PAYLOAD),
+            content_type="application/json",
+            HTTP_AUTHORIZATION="Bearer not-a-jwt",
+        )
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_a_deactivated_account_cannot_submit(self) -> None:
+        user = User.objects.create(username="gone", email="gone@example.com")
+        access = issue_token_pair(user)["access"]
+        User.objects.filter(pk=user.pk).update(is_active=False)
+
+        response = self.client.post(
+            URL,
+            data=json.dumps(VALID_PAYLOAD),
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {access}",
+        )
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_the_marking_scheme_stays_public(self) -> None:
+        """The landing page explains scoring to visitors who have not signed up."""
+        self.assertEqual(self.client.get("/api/evaluation-criteria/").status_code, 200)
+
+
+@override_settings(AI_PROVIDER="stub", AI_MAX_RETRIES=0)
+class ReviewErrorMappingTests(AuthenticatedReviewTestCase):
+    """Each domain failure must produce the right status and a safe message."""
 
     def assert_maps_to(self, exception, expected_status: int, expected_code: str) -> None:
         with patch(
             "reviews.views.ReviewService.create_review", side_effect=exception
         ):
-            response = self.post()
+            response = self.post(VALID_PAYLOAD)
 
         self.assertEqual(response.status_code, expected_status)
         body = response.json()
@@ -220,7 +301,7 @@ class ReviewErrorMappingTests(TestCase):
             "reviews.views.ReviewService.create_review",
             side_effect=AIServiceUnavailableError(secret),
         ):
-            response = self.post()
+            response = self.post(VALID_PAYLOAD)
 
         self.assertNotIn("hunter2", response.content.decode())
 

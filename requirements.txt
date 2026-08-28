@@ -3,6 +3,14 @@ Django==6.1
 djangorestframework==3.18.0
 django-cors-headers==4.9.0
 
+# Authentication
+# Bearer tokens for the API; token_blacklist (a Django app it ships with) is
+# what makes refresh-token rotation actually revoke the rotated-out token.
+djangorestframework-simplejwt==5.5.1
+# Server-to-server calls to the GitHub and Google OAuth endpoints. Only the
+# backend ever talks to a provider, so no client secret reaches the browser.
+requests==2.34.2
+
 # Configuration
 python-dotenv==1.2.3
 
