@@ -1,0 +1,138 @@
+# Backend CI - Django API.
+#
+# Two test jobs run the same suite against the two infrastructure combinations
+# settings.py actually supports:
+#
+#   sqlite    - DB_ENGINE=sqlite, local-memory cache (the default a fresh clone
+#               gets, and the fast signal on every push)
+#   postgres  - DB_ENGINE=postgres + REDIS_URL, matching docker-compose.yml
+#
+# Both are run because settings.py branches on those switches: a change that
+# only breaks the Postgres or Redis path would otherwise reach main unnoticed.
+#
+# No secret is needed. The suite stubs the AI provider (AI_PROVIDER="stub"),
+# so CI never calls a real model and no API key is exposed to a workflow.
+
+name: Backend CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Read-only token: this workflow only ever checks code out.
+permissions:
+  contents: read
+
+# A new push to the same branch makes the previous run irrelevant.
+concurrency:
+  group: backend-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: '3.12'
+  # DEBUG stays off so CI exercises the production code paths, which means a
+  # SECRET_KEY must be supplied. This value is a CI-only throwaway - the real
+  # key lives in the deployment environment and is never committed.
+  DJANGO_DEBUG: 'False'
+  DJANGO_SECRET_KEY: ci-only-throwaway-key-not-used-anywhere-else
+  DJANGO_ALLOWED_HOSTS: localhost,127.0.0.1
+  ENVIRONMENT_NAME: ci
+  LOG_LEVEL: WARNING
+  # Never redirect to HTTPS in the test client.
+  SECURE_SSL_REDIRECT: 'False'
+
+jobs:
+  test-sqlite:
+    name: Tests (sqlite + local cache)
+    runs-on: ubuntu-latest
+
+    env:
+      DB_ENGINE: sqlite
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Django system checks
+        run: python manage.py check
+
+      - name: Fail if a model change has no migration
+        run: python manage.py makemigrations --check --dry-run
+
+      - name: Run tests
+        run: python manage.py test
+
+  test-postgres:
+    name: Tests (postgres + redis)
+    runs-on: ubuntu-latest
+
+    # Same images and versions as docker-compose.yml, so CI and a laptop
+    # disagree about as little as possible.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: ai_code_review
+          POSTGRES_USER: ai_code_review
+          POSTGRES_PASSWORD: ci-postgres-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ai_code_review -d ai_code_review"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:8-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 3s
+          --health-retries 5
+
+    env:
+      DB_ENGINE: postgres
+      POSTGRES_DB: ai_code_review
+      POSTGRES_USER: ai_code_review
+      POSTGRES_PASSWORD: ci-postgres-password
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: '5432'
+      REDIS_URL: redis://localhost:6379/0
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Apply migrations
+        run: python manage.py migrate --noinput
+
+      - name: Run tests
+        run: python manage.py test
