@@ -10,7 +10,11 @@ Two conventions are fixed here and followed everywhere:
 
   2. Read-only projections of plain dataclasses use `serializers.Serializer`,
      not `ModelSerializer`. The marking scheme and a completed review are
-     configuration and domain objects, not database rows (until Phase 5).
+     configuration and domain objects rather than database rows - a stored
+     review is rebuilt into the same dataclass before serialization, so the
+     detail response cannot drift from the create response. The one
+     `ModelSerializer` here is the history list, which really is a projection
+     of rows and never needs the domain object.
 
 The request serializer is the trust boundary. Submitted code is untrusted input,
 and everything it must satisfy - size, language, character content - is enforced
@@ -24,6 +28,7 @@ import re
 from rest_framework import serializers
 
 from .languages import SUPPORTED_LANGUAGE_KEYS, SUPPORTED_LANGUAGES
+from .models import Review
 
 # Roughly 80k characters is ~2000 lines of ordinary source. Beyond that a review
 # stops being useful (the model loses the thread) and starts being expensive, so
@@ -71,7 +76,7 @@ class ReviewRequestSerializer(serializers.Serializer):
             )
 
         # NUL bytes indicate a binary paste, and break both the prompt and
-        # PostgreSQL text columns in Phase 5.
+        # PostgreSQL text columns.
         if "\x00" in value:
             raise serializers.ValidationError(
                 "The code contains null bytes. Please submit plain text source code."
@@ -193,14 +198,56 @@ class EvaluationSerializer(serializers.Serializer):
 class ReviewResultSerializer(serializers.Serializer):
     """The response body for POST /api/reviews/."""
 
+    id = serializers.CharField(source="review_id", read_only=True)
     summary = serializers.CharField(read_only=True)
     language = serializers.CharField(read_only=True)
     filename = serializers.CharField(read_only=True)
     cached = serializers.BooleanField(read_only=True)
     # Promoted to the top level as well as living inside `evaluation`, because
-    # the history list (Phase 5) needs them without the full breakdown.
+    # the history list needs them without the full breakdown.
     score = serializers.IntegerField(source="evaluation.total_score", read_only=True)
     grade = serializers.CharField(source="evaluation.grade", read_only=True)
     evaluationBand = serializers.CharField(source="evaluation.band", read_only=True)
     evaluation = EvaluationSerializer(read_only=True)
     issues = ReviewIssueSerializer(many=True, read_only=True)
+
+
+# --------------------------------------------------------------------------
+# Stored review history
+# --------------------------------------------------------------------------
+
+class ReviewListItemSerializer(serializers.ModelSerializer):
+    """One row of the history list.
+
+    Deliberately not the full review: the list shows enough to choose a review
+    to open, and nothing more. Sending every stored issue and category for
+    every row would make the history page grow with the size of past
+    submissions rather than with the number of them, and the submitted code -
+    the largest field by far - has no business travelling until asked for.
+    """
+
+    id = serializers.CharField(read_only=True)
+    score = serializers.IntegerField(source="total_score", read_only=True)
+    maxScore = serializers.IntegerField(source="max_score", read_only=True)
+    evaluationBand = serializers.CharField(source="band", read_only=True)
+    markingSchemeVersion = serializers.CharField(
+        source="marking_scheme_version", read_only=True
+    )
+    issueCount = serializers.IntegerField(read_only=True)
+    createdAt = serializers.DateTimeField(source="created_at", read_only=True)
+
+    class Meta:
+        model = Review
+        fields = [
+            "id",
+            "language",
+            "filename",
+            "summary",
+            "score",
+            "maxScore",
+            "grade",
+            "evaluationBand",
+            "markingSchemeVersion",
+            "issueCount",
+            "createdAt",
+        ]

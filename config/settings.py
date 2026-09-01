@@ -381,10 +381,12 @@ FILE_UPLOAD_MAX_MEMORY_SIZE = MAX_REQUEST_BODY_BYTES
 # The key is read here and never leaves the backend. Angular talks to Django;
 # only Django talks to the AI provider.
 
-AI_PROVIDER = env_str("AI_PROVIDER", "openai")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = env_str("OPENAI_MODEL", "gpt-4o-mini")
-AI_REQUEST_TIMEOUT_SECONDS = env_int("AI_REQUEST_TIMEOUT_SECONDS", 60)
+AI_PROVIDER = env_str("AI_PROVIDER", "gemini")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = env_str("GEMINI_MODEL", "gemini-3.6-flash")
+# Measured: a ~3,000-character file takes Gemini 40-82 seconds, so 60 failed
+# roughly one review in three. 180 leaves headroom for a larger submission.
+AI_REQUEST_TIMEOUT_SECONDS = env_int("AI_REQUEST_TIMEOUT_SECONDS", 180)
 AI_MAX_RETRIES = env_int("AI_MAX_RETRIES", 1)
 
 

@@ -66,6 +66,25 @@ class AITimeoutError(ReviewError):
     )
 
 
+class AIQuotaExceededError(ReviewError):
+    """The provider account has no credit or quota left.
+
+    Separate from AIServiceUnavailableError even though both are 503, because
+    the two arrive as the same HTTP 429 from the provider but need opposite
+    advice:
+    a rate limit clears on its own in seconds, an exhausted balance never does.
+    Telling the user to "try again shortly" in the second case sends them into
+    a loop that cannot succeed, so this says who has to act instead.
+    """
+
+    status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    error_code = "ai_quota_exceeded"
+    user_message = (
+        "The AI review service has run out of credit, so no reviews can be run "
+        "until an administrator tops up the provider account."
+    )
+
+
 class AINotConfiguredError(ReviewError):
     """No API key is configured for the selected provider."""
 

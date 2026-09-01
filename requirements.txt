@@ -22,4 +22,6 @@ redis==8.1.0
 django-redis==7.0.0
 
 # AI provider (used from Phase 2)
-openai==3.5.0
+# Reviews run on Google Gemini. httpx is not listed separately: google-genai
+# requires it and raises its timeout type, which ai_providers.py catches.
+google-genai==2.21.0

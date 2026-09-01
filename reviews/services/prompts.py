@@ -1,8 +1,8 @@
 """
 Prompt and response-schema construction for the AI reviewer.
 
-Two jobs, both kept out of the provider so that swapping OpenAI for another
-vendor does not mean rewriting the prompt:
+Two jobs, both kept out of the provider so that swapping one vendor for
+another does not mean rewriting the prompt:
 
   1. build the JSON Schema the model must fill in, derived from the *live*
      marking scheme so the categories can never drift out of sync;
@@ -52,10 +52,13 @@ MAX_ISSUES = 25
 def build_response_schema(marking_scheme: MarkingScheme) -> dict[str, Any]:
     """JSON Schema for the review response.
 
-    Written for OpenAI structured outputs in strict mode, which requires that
-    every property is listed in `required` and that `additionalProperties` is
-    false on every object. Optional-in-spirit fields are therefore expressed as
-    nullable types (`["integer", "null"]`) rather than by omission.
+    Written as plain JSON Schema, in the strict style structured-output modes
+    expect: every property listed in `required` and `additionalProperties` false
+    on every object, so optional-in-spirit fields are expressed as nullable types
+    (`["integer", "null"]`) rather than by omission.
+
+    Kept vendor-neutral deliberately. Gemini accepts all of this except the type
+    array, which `to_gemini_schema` rewrites as an `anyOf` on the way out.
     """
     category_names = list(marking_scheme.category_names)
 

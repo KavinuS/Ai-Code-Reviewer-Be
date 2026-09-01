@@ -9,15 +9,16 @@ The one place that knows the *order of operations* for producing a review:
         -> retry once on a failed evaluation, with a corrective prompt
         -> ReviewResult
 
-Phase 4 inserts a cache lookup ahead of the AI call and a cache write after it,
-and Phase 5 inserts a database save. Both slot in here without touching the AI
-or evaluation layers - which is the reason this module exists at all rather than
-the logic living in the view.
+Phase 4 inserts a cache lookup ahead of the AI call and a cache write after it.
+Phase 5's database save sits at the end of `create_review`, and slotting it in
+touched neither the AI nor the evaluation layer - which is the reason this
+module exists at all rather than the logic living in the view.
 """
 
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 
 from django.conf import settings
 
@@ -25,6 +26,7 @@ from ..domain import ReviewResult
 from ..evaluation.evaluation_service import EvaluationService
 from ..exceptions import InvalidEvaluationError
 from .ai_review_service import AIReviewRequest, AIReviewService
+from .review_repository import save_review
 
 logger = logging.getLogger(__name__)
 
@@ -42,8 +44,13 @@ class ReviewService:
             max_retries if max_retries is not None else settings.AI_MAX_RETRIES
         )
 
-    def create_review(self, request: AIReviewRequest) -> ReviewResult:
-        """Produce a validated review, or raise a ReviewError explaining why not."""
+    def create_review(self, request: AIReviewRequest, *, user=None) -> ReviewResult:
+        """Produce a validated review, or raise a ReviewError explaining why not.
+
+        `user` is the owner to store the review against. It is optional so the
+        pipeline stays runnable without a database - the AI and evaluation tests
+        exercise this method directly - but the API always passes one.
+        """
         output, evaluation = self._review_with_correction(request)
 
         logger.info(
@@ -55,7 +62,7 @@ class ReviewService:
             len(output.issues),
         )
 
-        return ReviewResult(
+        result = ReviewResult(
             summary=output.summary,
             evaluation=evaluation,
             issues=output.issues,
@@ -63,6 +70,18 @@ class ReviewService:
             filename=request.filename,
             cached=False,
         )
+
+        if user is None:
+            return result
+
+        review = save_review(
+            user=user,
+            result=result,
+            code=request.code,
+            instructions=request.instructions,
+        )
+        logger.info("Review stored: id=%s user_id=%s", review.pk, user.pk)
+        return replace(result, review_id=str(review.pk))
 
     def _review_with_correction(self, request: AIReviewRequest):
         """Call the AI, and re-ask once with a correction if scoring fails.

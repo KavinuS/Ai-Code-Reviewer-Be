@@ -7,7 +7,8 @@ and validated. They sit between the AI layer (raw JSON) and the API layer
 
   * services return typed objects, not loose dictionaries,
   * the evaluation service can be tested without HTTP or a database,
-  * Phase 5 can map these onto Django models without changing any caller.
+  * they map onto Django models in review_repository.py without any caller
+    knowing a database exists.
 
 They are frozen: once a review has been validated and scored, nothing
 downstream should be able to quietly alter a score.
@@ -112,6 +113,10 @@ class ReviewResult:
     filename: str = ""
     #: True when served from cache rather than a fresh AI call (Phase 4).
     cached: bool = False
+    #: Identity of the stored row, once persisted. Empty for a review that was
+    #: produced but not saved, which is what an anonymous or failed save looks
+    #: like - the result is still valid, it just has nowhere to be fetched from.
+    review_id: str = ""
 
     @property
     def issue_counts_by_type(self) -> dict[str, int]:

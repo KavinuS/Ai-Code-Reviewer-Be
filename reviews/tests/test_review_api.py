@@ -22,6 +22,7 @@ from django.test import TestCase, override_settings
 from accounts.services.tokens import issue_token_pair
 from reviews.exceptions import (
     AINotConfiguredError,
+    AIQuotaExceededError,
     AIServiceUnavailableError,
     AITimeoutError,
     InvalidAIResponseError,
@@ -275,6 +276,13 @@ class ReviewErrorMappingTests(AuthenticatedReviewTestCase):
         self.assert_maps_to(
             AIServiceUnavailableError("upstream down"), 503, "ai_unavailable"
         )
+
+    def test_exhausted_quota_maps_to_503_with_its_own_code(self) -> None:
+        """Distinct from ai_unavailable: waiting will never fix this one."""
+        body = self.assert_maps_to(
+            AIQuotaExceededError("no credit"), 503, "ai_quota_exceeded"
+        )
+        self.assertNotIn("try again shortly", body["detail"].lower())
 
     def test_ai_timeout_maps_to_504(self) -> None:
         self.assert_maps_to(AITimeoutError("too slow"), 504, "ai_timeout")

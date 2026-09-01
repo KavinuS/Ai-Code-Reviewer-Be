@@ -15,7 +15,18 @@ from reviews.domain import Confidence, IssueType, Severity
 from reviews.evaluation.evaluation_service import EvaluationService
 from reviews.evaluation.marking_scheme import get_active_marking_scheme
 from reviews.exceptions import InvalidAIResponseError, InvalidEvaluationError
-from reviews.services.ai_providers import AIPrompt, StubReviewProvider
+from reviews.exceptions import (
+    AINotConfiguredError,
+    AIQuotaExceededError,
+    AIServiceUnavailableError,
+)
+from reviews.services.ai_providers import (
+    AIPrompt,
+    GeminiReviewProvider,
+    StubReviewProvider,
+    _is_quota_exhausted,
+    to_gemini_schema,
+)
 from reviews.services.ai_review_service import AIReviewRequest, AIReviewService
 from reviews.services.prompts import (
     CODE_FENCE_CLOSE,
@@ -312,3 +323,90 @@ class StubProviderTests(unittest.TestCase):
         self.assertEqual(len(result.evaluation.categories), len(SCHEME.categories))
         self.assertTrue(result.summary)
         self.assertEqual(result.evaluation.grade, "B")
+
+
+class QuotaDetectionTests(unittest.TestCase):
+    """A 429 means two different things and only one of them clears by waiting."""
+
+    @staticmethod
+    def _error(message: str):
+        """A stand-in shaped like a google.genai ClientError."""
+        return type(
+            "FakeClientError", (Exception,), {"code": 429, "message": message}
+        )()
+
+    def test_an_exhausted_allowance_is_recognised(self) -> None:
+        self.assertTrue(
+            _is_quota_exhausted(
+                self._error(
+                    "You exceeded your current quota, please check your plan and "
+                    "billing details."
+                )
+            )
+        )
+
+    def test_a_genuine_rate_limit_is_not_treated_as_a_quota_failure(self) -> None:
+        self.assertFalse(
+            _is_quota_exhausted(
+                self._error("Resource has been exhausted (e.g. check quota).")
+            )
+        )
+
+    def test_an_error_carrying_no_message_is_not_a_quota_failure(self) -> None:
+        self.assertFalse(_is_quota_exhausted(Exception("no attributes at all")))
+
+    def test_the_two_kinds_of_429_map_to_different_domain_errors(self) -> None:
+        quota = GeminiReviewProvider._client_error(
+            self._error("check your plan and billing details")
+        )
+        rate_limit = GeminiReviewProvider._client_error(self._error("slow down"))
+
+        self.assertIsInstance(quota, AIQuotaExceededError)
+        self.assertIsInstance(rate_limit, AIServiceUnavailableError)
+
+    def test_a_rejected_key_and_an_unknown_model_are_configuration_errors(self) -> None:
+        for code, message in ((403, "permission denied"), (404, "model not found")):
+            error = GeminiReviewProvider._client_error(
+                type("E", (Exception,), {"code": code, "message": message})()
+            )
+            self.assertIsInstance(error, AINotConfiguredError)
+
+
+class GeminiSchemaAdapterTests(unittest.TestCase):
+    """Gemini accepts the shared schema apart from one JSON Schema construct."""
+
+    def test_a_nullable_type_array_becomes_an_anyof(self) -> None:
+        converted = to_gemini_schema(
+            {"type": "object", "properties": {"line": {"type": ["integer", "null"]}}}
+        )
+
+        self.assertEqual(
+            converted["properties"]["line"],
+            {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+        )
+
+    def test_the_real_review_schema_carries_no_type_arrays(self) -> None:
+        converted = to_gemini_schema(build_response_schema(SCHEME))
+
+        def assert_no_type_arrays(node) -> None:
+            if isinstance(node, dict):
+                self.assertNotIsInstance(node.get("type"), list)
+                for value in node.values():
+                    assert_no_type_arrays(value)
+            elif isinstance(node, list):
+                for entry in node:
+                    assert_no_type_arrays(entry)
+
+        assert_no_type_arrays(converted)
+
+    def test_everything_else_survives_the_conversion(self) -> None:
+        """Gemini supports required/additionalProperties/enum - keep them."""
+        original = build_response_schema(SCHEME)
+        converted = to_gemini_schema(original)
+
+        self.assertEqual(converted["required"], original["required"])
+        self.assertIs(converted["additionalProperties"], False)
+        self.assertEqual(
+            converted["properties"]["issues"]["items"]["properties"]["severity"],
+            original["properties"]["issues"]["items"]["properties"]["severity"],
+        )
