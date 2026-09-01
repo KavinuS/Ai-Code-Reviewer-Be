@@ -7,7 +7,9 @@ here, and no secret is ever committed.
 
 Two switches decide which infrastructure this process talks to:
 
-  * DB_ENGINE  - "sqlite" (default) or "postgres"
+  * DB_ENGINE  - "sqlite" (default) or "postgres", read only when
+                 DATABASE_URL is unset; a managed host publishes a single
+                 DATABASE_URL and that connection string wins outright
   * REDIS_URL  - when set, Redis is used for caching; otherwise Django's
                  in-process local-memory cache is used
 
@@ -21,6 +23,7 @@ from __future__ import annotations
 import os
 from datetime import timedelta
 from pathlib import Path
+from urllib.parse import parse_qsl, unquote, urlparse
 
 from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
@@ -89,6 +92,23 @@ if not SECRET_KEY:
     SECRET_KEY = "insecure-development-key-not-for-production-use"
 
 ALLOWED_HOSTS = env_list("DJANGO_ALLOWED_HOSTS", default=("localhost", "127.0.0.1"))
+CSRF_TRUSTED_ORIGINS = env_list("CSRF_TRUSTED_ORIGINS")
+
+# Render assigns the public hostname when the service is created and injects it
+# as RENDER_EXTERNAL_HOSTNAME, so it cannot be written into DJANGO_ALLOWED_HOSTS
+# ahead of time. Appending it here means the deployment needs no hand-edited
+# host list. A missing hostname is not a subtle failure: every request including
+# the health check is refused as DisallowedHost, so the service reports itself
+# down with nothing in the response explaining why.
+RENDER_EXTERNAL_HOSTNAME = os.environ.get("RENDER_EXTERNAL_HOSTNAME", "").strip()
+if RENDER_EXTERNAL_HOSTNAME:
+    if RENDER_EXTERNAL_HOSTNAME not in ALLOWED_HOSTS:
+        ALLOWED_HOSTS.append(RENDER_EXTERNAL_HOSTNAME)
+    # The admin posts forms to this origin over HTTPS terminated at Render's
+    # proxy, which Django cannot infer from the request alone.
+    origin = f"https://{RENDER_EXTERNAL_HOSTNAME}"
+    if origin not in CSRF_TRUSTED_ORIGINS:
+        CSRF_TRUSTED_ORIGINS.append(origin)
 
 ROOT_URLCONF = "config.urls"
 WSGI_APPLICATION = "config.wsgi.application"
@@ -122,6 +142,9 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
+    # Directly below SecurityMiddleware, as WhiteNoise requires: static files
+    # are then served without running the rest of the stack for them.
+    "whitenoise.middleware.WhiteNoiseMiddleware",
     # CorsMiddleware must sit above CommonMiddleware so that CORS headers are
     # attached even to responses CommonMiddleware short-circuits (redirects).
     "corsheaders.middleware.CorsMiddleware",
@@ -153,32 +176,81 @@ TEMPLATES = [
 # Database
 # --------------------------------------------------------------------------
 
-DB_ENGINE = env_str("DB_ENGINE", "sqlite").lower()
+def database_from_url(url: str) -> dict[str, object]:
+    """Translate a DATABASE_URL connection string into a DATABASES entry.
 
-if DB_ENGINE == "postgres":
-    DATABASES = {
-        "default": {
-            "ENGINE": "django.db.backends.postgresql",
-            "NAME": env_str("POSTGRES_DB"),
-            "USER": env_str("POSTGRES_USER"),
-            "PASSWORD": env_str("POSTGRES_PASSWORD"),
-            "HOST": env_str("POSTGRES_HOST", "localhost"),
-            "PORT": env_str("POSTGRES_PORT", "5432"),
-            # Reuse connections for 60s instead of reconnecting per request.
-            "CONN_MAX_AGE": env_int("POSTGRES_CONN_MAX_AGE", 60),
-        }
+    A managed host publishes one connection string and nothing else, so this is
+    the only shape it can be configured with. It is parsed here rather than
+    through a dependency because the translation is short and one line of it -
+    the TLS default below - is a decision worth making in the open.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in {"postgres", "postgresql"}:
+        raise ImproperlyConfigured(
+            "DATABASE_URL must be a postgres:// or postgresql:// url, "
+            f"got {parsed.scheme or '(none)'}://."
+        )
+
+    name = unquote(parsed.path).lstrip("/")
+    if not name:
+        raise ImproperlyConfigured("DATABASE_URL is missing a database name.")
+
+    host = parsed.hostname or ""
+    options = dict(parse_qsl(parsed.query))
+    # Managed providers refuse an unencrypted connection, and the refusal names
+    # the wrong problem - it surfaces as the server closing the connection, not
+    # as a TLS requirement. Ask for TLS anywhere but a local host, where asking
+    # would itself be the failure.
+    if "sslmode" not in options and host not in {"", "localhost", "127.0.0.1", "::1"}:
+        options["sslmode"] = "require"
+
+    return {
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": name,
+        "USER": unquote(parsed.username or ""),
+        "PASSWORD": unquote(parsed.password or ""),
+        "HOST": host,
+        "PORT": str(parsed.port or ""),
+        "CONN_MAX_AGE": env_int("POSTGRES_CONN_MAX_AGE", 60),
+        "OPTIONS": options,
     }
-elif DB_ENGINE == "sqlite":
-    DATABASES = {
-        "default": {
-            "ENGINE": "django.db.backends.sqlite3",
-            "NAME": BASE_DIR / "db.sqlite3",
-        }
-    }
+
+
+# One connection string wins over every POSTGRES_* value. Both taking effect at
+# once could only mean connecting to whichever half was edited more recently,
+# and on a managed host DATABASE_URL is the half the platform maintains.
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+
+if DATABASE_URL:
+    DB_ENGINE = "postgres"
+    DATABASES = {"default": database_from_url(DATABASE_URL)}
 else:
-    raise ImproperlyConfigured(
-        f"DB_ENGINE must be 'sqlite' or 'postgres', got {DB_ENGINE!r}."
-    )
+    DB_ENGINE = env_str("DB_ENGINE", "sqlite").lower()
+
+    if DB_ENGINE == "postgres":
+        DATABASES = {
+            "default": {
+                "ENGINE": "django.db.backends.postgresql",
+                "NAME": env_str("POSTGRES_DB"),
+                "USER": env_str("POSTGRES_USER"),
+                "PASSWORD": env_str("POSTGRES_PASSWORD"),
+                "HOST": env_str("POSTGRES_HOST", "localhost"),
+                "PORT": env_str("POSTGRES_PORT", "5432"),
+                # Reuse connections for 60s instead of reconnecting per request.
+                "CONN_MAX_AGE": env_int("POSTGRES_CONN_MAX_AGE", 60),
+            }
+        }
+    elif DB_ENGINE == "sqlite":
+        DATABASES = {
+            "default": {
+                "ENGINE": "django.db.backends.sqlite3",
+                "NAME": BASE_DIR / "db.sqlite3",
+            }
+        }
+    else:
+        raise ImproperlyConfigured(
+            f"DB_ENGINE must be 'sqlite' or 'postgres', got {DB_ENGINE!r}."
+        )
 
 
 # --------------------------------------------------------------------------
@@ -414,6 +486,22 @@ USE_TZ = True
 
 STATIC_URL = "static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
+
+# A Render web service is the application process; nothing sits in front of it
+# to serve /static/, so without WhiteNoise the admin loads unstyled. The
+# manifest backend hashes each filename during collectstatic so the files can be
+# cached permanently - which also means a missing collectstatic becomes a loud
+# error at request time rather than a silently stale asset.
+STORAGES = {
+    "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+    "staticfiles": {
+        "BACKEND": (
+            "django.contrib.staticfiles.storage.StaticFilesStorage"
+            if DEBUG
+            else "whitenoise.storage.CompressedManifestStaticFilesStorage"
+        )
+    },
+}
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 

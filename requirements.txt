@@ -25,3 +25,13 @@ django-redis==7.0.0
 # Reviews run on Google Gemini. httpx is not listed separately: google-genai
 # requires it and raises its timeout type, which ai_providers.py catches.
 google-genai==2.21.0
+
+# Deployment (Render)
+# Django's runserver is a development server and says so; gunicorn is what
+# actually serves the deployed process. The timeout has to clear the AI call:
+# a review measured 40-82 seconds and gunicorn's default of 30 would kill the
+# worker mid-request, which surfaces to the client as an empty response.
+gunicorn==26.2.0
+# A Render web service has no web server in front of it, so /static/ is served
+# from inside the process. Without this the admin renders with no CSS.
+whitenoise==6.12.0
